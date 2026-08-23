@@ -1,0 +1,141 @@
+name: CI/CD - Build, Test, Push to ECR, Deploy
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy to EKS after image push?"
+        required: false
+        default: "true"
+        type: boolean
+
+env:
+  AWS_REGION: ap-south-1                      # change to your region
+  ECR_REPOSITORY: demo-app                    # ECR repo name
+  EKS_CLUSTER_NAME: my-eks-cluster             # change to your cluster
+  HELM_RELEASE_NAME: demo-app
+  HELM_CHART_PATH: helm/demo-app
+  K8S_NAMESPACE: default
+
+permissions:
+  id-token: write     # required for OIDC -> AWS
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------
+  # 1. Build & unit test the Spring Boot app
+  # ---------------------------------------------------------
+  build-test:
+    name: Build & Unit Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run unit tests
+        run: mvn -B test
+
+      - name: Build jar (skip tests, already run)
+        run: mvn -B clean package -DskipTests
+
+      - name: Upload jar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-app-jar
+          path: target/demo-app.jar
+          retention-days: 5
+
+  # ---------------------------------------------------------
+  # 2. Build Docker image & push to Amazon ECR
+  #    (only on push to main, not on PRs)
+  # ---------------------------------------------------------
+  docker-build-push:
+    name: Docker Build & Push to ECR
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      image_repository: ${{ steps.build-image.outputs.image_repository }}
+      image_tag: ${{ steps.vars.outputs.sha_short }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Uses OIDC - no long-lived AWS keys stored in GitHub secrets.
+      # Requires an IAM role trusted for GitHub's OIDC provider.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ steps.vars.outputs.sha_short }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build -t "$IMAGE_URI" -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
+          docker push "$IMAGE_URI"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          echo "image_repository=$ECR_REGISTRY/$ECR_REPOSITORY" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------
+  # 3. Deploy to EKS via Helm (gated by a GitHub Environment
+  #    so you can require manual approval before prod rollout)
+  # ---------------------------------------------------------
+  deploy:
+    name: Deploy to EKS
+    needs: docker-build-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production   # configure required reviewers under Settings > Environments
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.0
+
+      - name: Helm upgrade --install
+        run: |
+          helm upgrade --install "$HELM_RELEASE_NAME" "$HELM_CHART_PATH" \
+            --namespace "$K8S_NAMESPACE" \
+            --create-namespace \
+            --set image.repository="${{ needs.docker-build-push.outputs.image_repository }}" \
+            --set image.tag="${{ needs.docker-build-push.outputs.image_tag }}" \
+            --wait --timeout 5m
+
+      - name: Verify rollout
+        run: kubectl rollout status deployment/"$HELM_RELEASE_NAME" -n "$K8S_NAMESPACE"
