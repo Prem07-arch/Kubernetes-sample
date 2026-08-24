@@ -15,7 +15,7 @@ on:
 
 env:
   AWS_REGION: ap-south-1                      # change to your region
-  ECR_REPOSITORY: demo-app                    # ECR repo name
+  ECR_REPOSITORY: devops-learning/java-eks                    # ECR repo name
   EKS_CLUSTER_NAME: my-eks-cluster             # change to your cluster
   HELM_RELEASE_NAME: demo-app
   HELM_CHART_PATH: helm/demo-app
